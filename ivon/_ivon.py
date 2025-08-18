@@ -200,7 +200,7 @@ class IVON(torch.optim.Optimizer):
             noise_sample = (
                 torch.randn(gnumel, device=self._device, dtype=self._dtype)
                 / (
-                    group["ess"] * (group["hess"] + group["weight_decay"])
+                    group["ess"] * (group["hess"].to(self._device) + group["weight_decay"])
                 ).sqrt()
             )
             noise_samples.append(noise_sample)
@@ -228,6 +228,11 @@ class IVON(torch.optim.Optimizer):
 
         offset = 0
         for group in self.param_groups:
+            
+            if group.get("no_update", False):
+                offset += group["numel"]
+                continue
+            
             lr = group["lr"]
             b1 = group["beta1"]
             b2 = group["beta2"]
