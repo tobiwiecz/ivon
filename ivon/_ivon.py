@@ -82,12 +82,6 @@ class IVON(torch.optim.Optimizer):
         self.debias = debias
         self.rescale_lr = rescale_lr
 
-        # Pre-allocate gradient buffer for efficiency
-        if self._numel > 0:
-            self._grad_buffer = torch.zeros(self._numel, device=self._device, dtype=self._dtype)
-        else:
-            self._grad_buffer = None
-
         # Set up distributed random generator
         if dist.is_initialized():
             generator_seed = 42 + dist.get_rank()
@@ -150,7 +144,10 @@ class IVON(torch.optim.Optimizer):
     def _restore_param_average(
         self, train: bool, param_avg: Tensor, noise: Tensor
     ):
+        # TIP 1: More memory-efficient gradient collection
         offset = 0
+        grad_tensors = []  # Collect gradient references instead of copying
+        
         for group in self.param_groups:
             for p in group["params"]:
                 if p is None:
@@ -159,28 +156,35 @@ class IVON(torch.optim.Optimizer):
                 p_slice = slice(offset, offset + p.numel())
                 p.data = param_avg[p_slice].view(p.shape)
                 
-                # Efficiently collect gradients using pre-allocated buffer
-                if train and self._grad_buffer is not None:
+                # Collect gradient tensors without copying to buffer
+                if train:
                     if p.requires_grad and p.grad is not None:
-                        self._grad_buffer[p_slice] = p.grad.flatten()
+                        grad_tensors.append(p.grad.flatten())
                     else:
-                        self._grad_buffer[p_slice].zero_()
+                        grad_tensors.append(torch.zeros_like(p.data.flatten()))
                         
                 offset += p.numel()
         assert offset == self._numel  # sanity check
 
-        if train and self._grad_buffer is not None:  # collect grad sample for training
+        if train and grad_tensors:  # collect grad sample for training
+            # Use cat instead of copying to pre-allocated buffer
+            current_grad = torch.cat(grad_tensors, dim=0)
             count = self.state["count"] + 1
             self.state["count"] = count
             self.state["avg_grad"] = _welford_mean(
-                self.state["avg_grad"], self._grad_buffer.clone(), count
+                self.state["avg_grad"], current_grad, count
             )
+            
             if self.hess_approx == 'price':
+                # Compute noise * grad directly without intermediate buffer
+                noise_grad = noise * current_grad
                 self.state['avg_nxg'] = _welford_mean(
-                    self.state['avg_nxg'], noise * self._grad_buffer, count)
+                    self.state['avg_nxg'], noise_grad, count)
             elif self.hess_approx == 'gradsq':
+                # Compute grad^2 directly without intermediate buffer
+                grad_squared = current_grad * current_grad
                 self.state['avg_gsq'] = _welford_mean(
-                    self.state['avg_gsq'], self._grad_buffer.square(), count)
+                    self.state['avg_gsq'], grad_squared, count)
 
     @torch.no_grad()
     def step(self, closure: ClosureType = None) -> Optional[Tensor]:
@@ -222,39 +226,45 @@ class IVON(torch.optim.Optimizer):
             self.state["count"] = count_tensor.item()
 
     def _sample_params(self) -> Tuple[Tensor, Tensor]:
-        noise_samples = []
-        param_avgs = []
-
+        # TIP 2: More memory-efficient parameter sampling
+        # Pre-allocate output tensors once
+        param_avg_buffer = torch.empty(self._numel, device=self._device, dtype=self._dtype)
+        noise_buffer = torch.empty(self._numel, device=self._device, dtype=self._dtype)
+        
         offset = 0
         for group in self.param_groups:
             gnumel = group["numel"]
-            noise_sample = (
-                torch.randn(gnumel, device=self._device, dtype=self._dtype, generator=self._generator)
-                / (
-                    group["ess"] * (group["hess"] + group["weight_decay"])
-                ).sqrt()
-            )
-            noise_samples.append(noise_sample)
-
+            
+            # Generate noise directly into buffer slice to avoid temporary tensors
+            group_noise = noise_buffer[offset:offset + gnumel]
+            torch.randn(gnumel, device=self._device, dtype=self._dtype, 
+                       generator=self._generator, out=group_noise)
+            # In-place division to avoid creating temporary tensor
+            group_noise.div_((group["ess"] * (group["hess"] + group["weight_decay"])).sqrt())
+            
             goffset = 0
             for p in group["params"]:
                 if p is None:
                     continue
 
-                p_avg = p.data.flatten()
                 numel = p.numel()
-                p_noise = noise_sample[goffset : goffset + numel]
-
-                param_avgs.append(p_avg)
-                p.data = (p_avg + p_noise).view(p.shape)
+                p_slice = slice(offset + goffset, offset + goffset + numel)
+                
+                # Store original parameter values in buffer
+                param_avg_buffer[p_slice] = p.data.flatten()
+                
+                # Add noise to parameters in-place
+                p.data.add_(group_noise[goffset:goffset + numel].view(p.shape))
                 goffset += numel
-                offset += numel
-            assert goffset == group["numel"]  # sanity check
+                
+            assert goffset == gnumel  # sanity check
+            offset += gnumel
         assert offset == self._numel  # sanity check
 
-        return torch.cat(param_avgs, 0), torch.cat(noise_samples, 0)
+        return param_avg_buffer, noise_buffer
 
     def _update(self):
+        # TIP 4: Optimize update method to reduce temporary tensor creation
         self.current_step += 1
 
         offset = 0
@@ -269,13 +279,11 @@ class IVON(torch.optim.Optimizer):
             b2 = group["beta2"]
             pg_slice = slice(offset, offset + group["numel"])
 
-            param_avg = torch.cat(
-                [p.flatten() for p in group["params"] if p is not None], 0
-            )
-
-            group["momentum"] = self._new_momentum(
-                self.state["avg_grad"][pg_slice], group["momentum"], b1
-            )
+            # TIP 4: Work with slices instead of concatenating all parameters
+            if self.state["avg_grad"] is not None:
+                group["momentum"] = self._new_momentum(
+                    self.state["avg_grad"][pg_slice], group["momentum"], b1
+                )
 
             group["hess"] = self._new_hess(
                 self.hess_approx,
@@ -288,28 +296,40 @@ class IVON(torch.optim.Optimizer):
                 group["weight_decay"],
             )
 
-            param_avg = self._new_param_averages(
-                param_avg,
-                group["hess"],
-                group["momentum"],
-                lr * (group["hess_init"] + group["weight_decay"]) if self.rescale_lr else lr,
-                group["weight_decay"],
-                group["clip_radius"],
-                1.0 - pow(b1, float(self.current_step)) if self.debias else 1.0,
-                group["hess_init"]
-            )
-
-            # update params
-            pg_offset = 0
-            for p in group["params"]:
-                if p is not None:
-                    p.data = param_avg[pg_offset : pg_offset + p.numel()].view(
-                        p.shape
-                    )
-                    pg_offset += p.numel()
-            assert pg_offset == group["numel"]  # sanity check
+            # TIP 4: Update parameters directly without creating intermediate concatenated tensor
+            self._update_params_inplace(group, pg_slice, offset)
             offset += group["numel"]
         assert offset == self._numel  # sanity check
+
+    def _update_params_inplace(self, group, pg_slice, global_offset):
+        """TIP 4: Update parameters in-place to avoid temporary tensors"""
+        lr = group["lr"]
+        lr_scale = (group["hess_init"] + group["weight_decay"]) if self.rescale_lr else 1.0
+        debias_factor = 1.0 - pow(group["beta1"], float(self.current_step)) if self.debias else 1.0
+        
+        local_offset = 0
+        for p in group["params"]:
+            if p is None:
+                continue
+                
+            p_numel = p.numel()
+            local_slice = slice(local_offset, local_offset + p_numel)
+            
+            # Get slices for this parameter
+            momentum_slice = group["momentum"][local_slice]
+            hess_slice = group["hess"][local_slice]
+            
+            # Compute update directly without intermediate tensors
+            param_flat = p.data.flatten()
+            update = torch.clamp(
+                (momentum_slice / debias_factor + group["weight_decay"] * param_flat) / 
+                (hess_slice + group["weight_decay"] + 1e-12),
+                min=-group["clip_radius"], max=group["clip_radius"]
+            )
+            
+            # Apply update in-place
+            p.data.sub_(update.view(p.shape), alpha=lr * lr_scale)
+            local_offset += p_numel
 
     @staticmethod
     def _get_nll_hess(method: str, hess, avg_nxg, avg_gsq, pg_slice) -> Tensor:
@@ -338,6 +358,7 @@ class IVON(torch.optim.Optimizer):
     def _new_param_averages(
         param_avg, hess, momentum, lr, wd, clip_radius, debias, hess_init
     ) -> Tensor:
+        # This method is now unused due to TIP 4 optimization
         return param_avg - lr * torch.clamp(
             (momentum / debias + wd * param_avg) / (hess + wd + 1e-12),
             min=-clip_radius,
