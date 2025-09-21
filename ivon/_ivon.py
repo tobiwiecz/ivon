@@ -240,7 +240,7 @@ class IVON(torch.optim.Optimizer):
             torch.randn(gnumel, device=self._device, dtype=self._dtype, 
                        generator=self._generator, out=group_noise)
             # In-place division to avoid creating temporary tensor
-            group_noise.div_((group["ess"] * (group["hess"] + group["weight_decay"])).sqrt())
+            group_noise.div_((group["ess"] * (group["hess"].to(self.device) + group["weight_decay"])).sqrt())
             
             goffset = 0
             for p in group["params"]:
